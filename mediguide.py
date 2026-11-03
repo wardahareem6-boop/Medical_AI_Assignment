@@ -125,14 +125,44 @@ def config():
             os.getenv('OPENAI_MODEL', values.get('OPENAI_MODEL') or 'gpt-6-astra').strip())
 
 
+
+def normalize_api_key(value):
+    key = value.strip()
+    if key.startswith('OPENAI_API_KEY='):
+        key = key.split('=', 1)[1].strip()
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in ('"', "'"):
+        key = key[1:-1].strip()
+    if key.lower().startswith('bearer '):
+        key = key[7:].strip()
+    if any(c.isspace() for c in key) or any(ord(c) > 127 for c in key):
+        raise ValueError('The pasted key contains spaces, line breaks or non-ASCII characters. Copy only the complete API key from OpenAI Platform.')
+    return key
+
+
+def check_connection(key, model, client=None):
+    key = normalize_api_key(key)
+    if not key:
+        raise ValueError('Enter your OpenAI API key first.')
+    if not model.strip():
+        raise ValueError('Enter a model in the sidebar.')
+    if client is None:
+        from openai import OpenAI
+        with OpenAI(api_key=key, timeout=15.0, max_retries=0) as connection:
+            connection.models.retrieve(model.strip())
+    else:
+        client.models.retrieve(model.strip())
+    return 'Connection accepted and selected model is accessible. This check does not generate a reply or verify generation quota. Restricted keys also need permission to create Responses.'
+
+
 def ai_pack(entry: dict, key: str, model: str, client=None) -> dict:
     # The model cannot override this rule or provide a lower-risk classification.
     if safety_status(entry) != 'not_assessed':
         raise ValueError('Please seek human medical help rather than waiting for AI. The offline note remains available.')
+    key = normalize_api_key(key)
     if not key or key.lower().startswith(('your', 'paste', 'replace')):
-        raise ValueError('Add your API key to .env and restart. Offline preparation works without a key.')
+        raise ValueError('Enter your API key in the sidebar. Offline preparation works without a key.')
     if not model.strip():
-        raise ValueError('Set OPENAI_MODEL in .env.')
+        raise ValueError('Enter a model in the sidebar.')
     if client is None:
         from openai import OpenAI
         client = OpenAI(api_key=key, timeout=90.0, max_retries=1)
@@ -159,14 +189,27 @@ def ai_pack(entry: dict, key: str, model: str, client=None) -> dict:
 def friendly_error(exc):
     if isinstance(exc, ValueError):
         return str(exc)
+    # Never display provider messages: they can contain part of a credential.
+    body = getattr(exc, 'body', None)
+    error = body.get('error', body) if isinstance(body, dict) else {}
+    code = error.get('code') if isinstance(error, dict) else None
+    specific = {
+        'invalid_api_key': 'OpenAI returned invalid_api_key (401). Copy the complete secret key, not its name or a masked preview. Check that it has not been revoked and belongs to your intended project.',
+        'insufficient_quota': 'OpenAI returned insufficient_quota (429). Check API billing, credits and project spending limits; replacing the key will not resolve quota.',
+        'model_not_found': 'The selected model is unavailable to this project. Choose a model your API project can access in the sidebar.',
+        'rate_limit_exceeded': 'OpenAI rate limit reached (429). Wait and try again, or check your project limits.',
+    }
+    if isinstance(code, str) and code in specific:
+        return specific[code]
     return {
-        'AuthenticationError': 'The API key was rejected. Check .env and restart.',
-        'RateLimitError': 'The API quota or rate limit was reached. Check billing or try later.',
-        'APITimeoutError': 'The AI request timed out. Your offline note is still available.',
-        'APIConnectionError': 'Cannot reach OpenAI. Check your connection.',
-        'NotFoundError': 'The configured model is unavailable. Check model access.',
+        'AuthenticationError': 'OpenAI authentication failed (401). Check the complete key and its project or organization access. A 401 is different from a billing/quota error.',
+        'PermissionDeniedError': 'OpenAI denied access (403). Check project membership, key endpoint permissions, model access and any IP restrictions. Connection checks require permission to read models; chat requires permission to create Responses.',
+        'RateLimitError': 'OpenAI returned a quota or rate-limit error (429). Check API billing, credits and project limits, or retry later.',
+        'APITimeoutError': 'The OpenAI request timed out. Your chat and notes remain available.',
+        'APIConnectionError': 'Cannot reach OpenAI. Check your internet connection, proxy or firewall.',
+        'NotFoundError': 'The configured model is unavailable. Check model access in your API project.',
         'BadRequestError': 'The API rejected the configuration. Use a model supporting Responses and structured output.',
-    }.get(type(exc).__name__, 'AI preparation is unavailable. Your offline note remains available.')
+    }.get(type(exc).__name__, 'The AI request failed. Your chat and notes remain available.')
 
 
 def validate_message(message):
@@ -200,10 +243,11 @@ def live_chat(message, history, language, key, model, context=None, client=None)
         raise ValueError('Choose a supported chat language.')
     if chat_warning(message):
         return EMERGENCY
+    key = normalize_api_key(key)
     if not key or key.lower().startswith(('your', 'paste', 'replace')):
-        raise ValueError('Add your API key to .env and select Live AI. Demo chat works without a key.')
+        raise ValueError('Enter your API key in the sidebar and select Live AI. Demo chat works without a key.')
     if not model.strip():
-        raise ValueError('Set OPENAI_MODEL in .env.')
+        raise ValueError('Enter a model in the sidebar.')
     if client is None:
         from openai import OpenAI
         client = OpenAI(api_key=key, timeout=90.0, max_retries=1)
@@ -238,12 +282,12 @@ def chat_page(st, key, model):
     st.caption('Ask in your own words, then continue with follow-up messages. This conversation cannot diagnose or replace professional care.')
     st.session_state.setdefault('chat_messages', [])
     left, right = st.columns(2)
-    mode = left.selectbox('Chat mode', ['Demo · offline', 'Live AI'], index=1 if key else 0)
+    mode = left.selectbox('Chat mode', ['Live AI', 'Demo · offline'], key='chat_mode')
     language = right.selectbox('Reply language', ['Roman Urdu', 'English', 'Urdu'])
     if mode == 'Live AI':
         st.info('Live chat sends your messages and up to 20 recent Live AI messages to OpenAI. Avoid names and identifying details.')
         if not key:
-            st.warning('API key pending. Add it to .env and restart, or choose Demo · offline.')
+            st.warning('Paste your OpenAI API key in the sidebar, press Enter, then agree below to start chatting. You can also choose Demo · offline.')
     else:
         st.info('Offline demo · Scripted replies to try the chat interface. No AI assessment or API call is made.')
     flags = st.multiselect('Immediate warning signs happening now · optional checklist', WARNING_SIGNS, key='chat_flags')
@@ -409,7 +453,7 @@ def main():
     import streamlit as st
     st.set_page_config(page_title='MediGuide | Care Preparation', page_icon='✚', layout='wide')
     st.markdown(CSS, unsafe_allow_html=True)
-    key, model = config()
+    _, model = config()
     st.session_state.setdefault('records', [])
     with st.sidebar:
         st.markdown('<div class="brand">✚ MediGuide<span> AI</span></div><div class="tagline">A CLEARER CONVERSATION ABOUT CARE</div>', unsafe_allow_html=True)
@@ -418,8 +462,32 @@ def main():
         st.write('01  Record what you notice\n\n02  Prepare useful questions\n\n03  Bring a clear summary')
         st.divider()
         st.caption('OPTIONAL AI CONNECTION')
-        st.success('Key configured' if key else 'Offline preparation ready')
-        st.caption(f'Model: {model}')
+        key = st.text_input('OpenAI API key', type='password', key='user_api_key',
+                            placeholder='Paste your API key here',
+                            help='Used only for your session. Never saved to a file or included in conversation downloads.').strip()
+        model = st.text_input('OpenAI model', value=model, key='user_model').strip()
+        try:
+            key = normalize_api_key(key)
+        except ValueError as exc:
+            st.error(str(exc))
+            key = ''
+        if st.button('Check connection', disabled=not key or not model, use_container_width=True):
+            try:
+                with st.spinner('Checking OpenAI authentication and model access…'):
+                    result = check_connection(key, model)
+                st.success(result)
+            except Exception as exc:
+                st.error(friendly_error(exc))
+        st.caption('Check connection sends only your key and selected model to OpenAI; no chat or health note is sent.')
+        if st.button('Remove API key', disabled=not key, use_container_width=True,
+                     on_click=lambda: st.session_state.update(user_api_key='')):
+            st.rerun()
+        if key:
+            st.success('Key entered · ready to try Live AI')
+            st.caption('Use Check connection, then send a Live AI message to check generation access.')
+        else:
+            st.info('Enter your API key to start Live AI.')
+        st.caption('Your key stays in this session and is sent only to OpenAI for requests. No .env file is needed.')
         if st.button('Clear this session', use_container_width=True):
             for item in list(st.session_state.keys()):
                 del st.session_state[item]
@@ -434,10 +502,10 @@ def main():
     elif page == 'Setup & privacy':
         st.subheader('Ready now. AI when you choose.')
         st.code('python -m pip install -r requirements.txt\npython -m streamlit run mediguide.py', language='powershell')
-        st.write('Offline mode builds a symptom note and appointment checklist. It does not simulate AI or assess medical urgency. To enable optional AI, edit the .env beside this file and restart.')
-        st.code('OPENAI_API_KEY=your-real-key\nOPENAI_MODEL=gpt-6-astra', language='bash')
+        st.write('Offline mode builds a symptom note and appointment checklist. It does not simulate AI or assess medical urgency. To enable optional AI, paste your own OpenAI API key in the sidebar and press Enter. Choose Live AI, agree to send messages, and enter your first message. No .env file or restart is needed.')
+        st.write('You can change the model in the sidebar. Remove API key clears the key; Clear this session also clears your notes and chat.')
         st.write('Use a model your account can access that supports Responses and structured outputs. Live use needs API billing. Requests have a 2,500 output-token limit, a 90-second timeout and one retry. This is not a dollar spending cap.')
-        st.markdown('**Privacy:** No names, contact details or account IDs are required. Avoid identifying details in free text. Notes stay in this session, up to 20 records, unless downloaded or explicitly sent to OpenAI. AI requests use `store=False`; provider policies still apply. No local database or shared cache is created. Clearing the session does not remove downloaded files or provider records. Keep `.env` private and out of source control.')
+        st.markdown('**Privacy:** No names, contact details or account IDs are required. Avoid identifying details in free text. Notes stay in this session, up to 20 records, unless downloaded or explicitly sent to OpenAI. AI requests use `store=False`; provider policies still apply. No local database or shared cache is created. Clearing the session does not remove downloaded files or provider records. Your entered API key is held only in your Streamlit session, excluded from exports, and sent only to OpenAI to authenticate requests. Remove it with Remove API key or Clear this session. Use a trusted app host and HTTPS when deployed.')
         st.markdown('**Limits:** The warning checklist is incomplete and is not a validated triage system. It does not interpret free-text descriptions. A discomfort rating cannot establish the severity of an illness. A human professional must assess symptoms; AI output can be wrong.')
         st.link_button('Warning-sign reference · NHS (UK)', SOURCE)
         st.link_button('OpenAI structured-output documentation', 'https://developers.openai.com/api/docs/guides/structured-outputs')
@@ -514,7 +582,7 @@ def main():
             if blocked:
                 st.error('AI is paused because of reported warning signs or high discomfort. Please seek human medical help; you can still download the note.')
             if not key:
-                st.info('Add your API key to .env and restart when ready. Offline notes and downloads already work.')
+                st.info('Enter your API key in the sidebar when ready. Offline notes and downloads already work.')
             if st.button('Generate AI preparation', type='primary', disabled=blocked or not consent or not key):
                 try:
                     with st.spinner('Preparing questions and a restatement…'):
@@ -644,6 +712,31 @@ class MediGuideTests(unittest.TestCase):
     def test_environment_override(self):
         with patch.dict(os.environ, {'OPENAI_API_KEY': 'test-env', 'OPENAI_MODEL': 'test-model'}):
             self.assertEqual(config(), ('test-env', 'test-model'))
+
+    def test_pasted_key_formats(self):
+        for pasted in [' sk-test ', '"sk-test"', "'sk-test'", 'OPENAI_API_KEY="sk-test"', 'Bearer sk-test']:
+            self.assertEqual(normalize_api_key(pasted), 'sk-test')
+        for pasted in ['sk-test\nmore', 'sk- test', 'sk-test\u200b']:
+            with self.assertRaises(ValueError): normalize_api_key(pasted)
+
+    def test_connection_checks_model_without_generation(self):
+        client = MagicMock()
+        self.assertIn('Connection accepted', check_connection('"sk-test"', 'test-model', client))
+        client.models.retrieve.assert_called_once_with('test-model')
+        client.responses.create.assert_not_called()
+
+    def test_provider_errors_are_specific_and_redacted(self):
+        from openai import AuthenticationError, RateLimitError
+        import httpx
+        response = httpx.Response(401, request=httpx.Request('GET', 'https://api.openai.com/v1/models'))
+        error = AuthenticationError('private-secret', response=response,
+                                    body={'code': 'invalid_api_key', 'message': 'private-secret'})
+        self.assertIn('invalid_api_key', friendly_error(error))
+        self.assertNotIn('private-secret', friendly_error(error))
+        quota = RateLimitError('private-secret', response=response,
+                              body={'error': {'code': 'insufficient_quota', 'message': 'private-secret'}})
+        self.assertIn('insufficient_quota', friendly_error(quota))
+        self.assertNotIn('private-secret', friendly_error(quota))
 
     def test_chat_empty_message(self):
         for text in ['', ' ', 'a' * 3001]:
